@@ -1,0 +1,4 @@
+/terraform/assign-workspaces/.terraform
+.terraform.lock.hcl
+*.tfstate
+*.backup
