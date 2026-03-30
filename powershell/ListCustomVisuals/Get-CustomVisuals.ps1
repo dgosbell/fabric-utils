@@ -29,14 +29,32 @@
 .PARAMETER WorkspaceFilter
     Optional filter to limit scanning to specific workspace names (supports wildcards).
 
+.PARAMETER TenantId
+    Azure AD tenant ID or domain to authenticate against. Required for B2B guest admins
+    connecting to a customer tenant. Example: "contoso.onmicrosoft.com" or a GUID.
+
 .PARAMETER UseBulkExport
     When specified, uses the Bulk Export Item Definitions (beta) API instead of
     individual Get Item Definition calls. Can be faster but is a beta feature.
+
+.PARAMETER PermissionWaitSeconds
+    Maximum seconds to wait for permission propagation after adding self to a workspace.
+    Uses exponential backoff polling. Default: 300 (5 minutes).
+
+.PARAMETER Resume
+    Resume a previously interrupted scan. Loads progress from the state file and skips
+    already-processed workspaces. Requires a state file from a previous run.
+
+.PARAMETER StateFilePath
+    Path to the JSON state file used for checkpoint/resume. Auto-generated alongside
+    the output CSV if not specified. When using -Resume, point this at the state file
+    from the interrupted run.
 
 .EXAMPLE
     .-FabricCustomVisuals -AddSelfToWorkspaces
     .-FabricCustomVisuals -OutputPath "C:\Reports\visuals.csv" -WorkspaceFilter "Sales*"
     .-FabricCustomVisuals -UseBulkExport -AddSelfToWorkspaces
+    .-FabricCustomVisuals -Resume -StateFilePath ".\CustomVisuals_State_20260320_101500.json"
 #>
 
 [CmdletBinding()]
@@ -46,7 +64,11 @@ param(
     [string]$LogPath,
     [switch]$AddSelfToWorkspaces,
     [string]$WorkspaceFilter,
-    [switch]$UseBulkExport
+    [string]$TenantId,
+    [switch]$UseBulkExport,
+    [int]$PermissionWaitSeconds = 300,
+    [switch]$Resume,
+    [string]$StateFilePath
 )
 
 #region --- Configuration ---
@@ -62,6 +84,9 @@ if (-not $ErrorLogPath) {
 }
 if (-not $LogPath) {
     $LogPath = Join-Path $PSScriptRoot "CustomVisuals_Log_$timestamp.log"
+}
+if (-not $StateFilePath) {
+    $StateFilePath = Join-Path $PSScriptRoot "CustomVisuals_State_$timestamp.json"
 }
 
 # AppSource custom visuals lookup URL
@@ -120,6 +145,178 @@ function Write-CsvRow {
         $Row | Export-Csv -Path $OutputPath -Append -NoTypeInformation -Encoding UTF8 -Force
     }
 }
+
+function Wait-ForPermissionPropagation {
+    <#
+    .SYNOPSIS
+        Retries a script block with exponential backoff until it succeeds or times out.
+        Designed for use after adding self to a workspace to wait for permission propagation.
+        Retries on 403 errors AND on transient errors (e.g., UnknownError from bulk export)
+        that commonly occur while permissions are still propagating.
+        Pattern: sleep → try → fail → increase delay → repeat.
+    #>
+    param(
+        [scriptblock]$Action,
+        [string]$WorkspaceName,
+        [int]$MaxWaitSeconds = 300,
+        [int]$InitialDelaySeconds = 10,
+        [double]$BackoffMultiplier = 2.0,
+        [int]$MaxDelaySeconds = 60
+    )
+
+    $totalWaited = 0
+    $currentDelay = $InitialDelaySeconds
+    $attempt = 0
+
+    while ($true) {
+        $attempt++
+
+        # Cap the delay so we don't exceed MaxWaitSeconds
+        $remainingTime = $MaxWaitSeconds - $totalWaited
+        if ($remainingTime -le 0) { break }
+        $sleepTime = [Math]::Min($currentDelay, $remainingTime)
+
+        Write-Log -Message "Waiting ${sleepTime}s for permission propagation on '$WorkspaceName' (attempt $attempt, ${totalWaited}s elapsed)" -Level 'INFO'
+        # Sleep with a per-second progress indicator
+        for ($s = 1; $s -le $sleepTime; $s++) {
+            $pctComplete = [Math]::Floor((($totalWaited + $s) / $MaxWaitSeconds) * 100)
+            Write-Progress -Id 2 -Activity "Waiting for permission propagation on '$WorkspaceName'" `
+                -Status "Attempt $attempt — $($totalWaited + $s)s / ${MaxWaitSeconds}s" `
+                -PercentComplete $pctComplete
+            Start-Sleep -Seconds 1
+        }
+        $totalWaited += $sleepTime
+
+        try {
+            Write-Progress -Id 2 -Activity "Permission propagation on '$WorkspaceName'" `
+                -Status "Attempt $attempt — testing access..." `
+                -PercentComplete ([Math]::Floor(($totalWaited / $MaxWaitSeconds) * 100))
+            $result = & $Action
+            Write-Progress -Id 2 -Activity "Permission propagation" -Completed
+            Write-Log -Message "Permission propagation confirmed for '$WorkspaceName' after ${totalWaited}s" -Level 'ACCESS'
+            return $result
+        }
+        catch {
+            $sc = $null
+            if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
+
+            # Determine if this is a retriable permission-propagation error
+            $isPermissionError = $false
+            if ($sc -eq 403) {
+                $isPermissionError = $true
+            }
+            elseif ($_.Exception -is [System.InvalidOperationException] -and $_.Exception.Message -match 'BulkExportFailed.*UnknownError') {
+                # Bulk export returns UnknownError while permissions are still propagating
+                $isPermissionError = $true
+            }
+
+            if (-not $isPermissionError) {
+                # Genuine non-permission error — dismiss progress and rethrow
+                Write-Progress -Id 2 -Activity "Permission propagation" -Completed
+                throw
+            }
+            Write-Log -Message "Still denied on '$WorkspaceName' after ${totalWaited}s (attempt $attempt): $($_.Exception.Message)" -Level 'WARN'
+        }
+
+        # Exponential backoff for next iteration
+        $currentDelay = [Math]::Min([int]($currentDelay * $BackoffMultiplier), $MaxDelaySeconds)
+    }
+
+    Write-Progress -Id 2 -Activity "Permission propagation" -Completed
+    throw "Permission propagation timed out for workspace '$WorkspaceName' after ${MaxWaitSeconds}s"
+}
+
+function Save-ScanState {
+    <#
+    .SYNOPSIS
+        Persists current scan progress to a JSON state file for resumability.
+    #>
+    param(
+        [string]$Path,
+        [hashtable]$State
+    )
+    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8 -Force
+}
+
+function Load-ScanState {
+    <#
+    .SYNOPSIS
+        Loads scan state from a previous run. Returns $null if no state file exists.
+    #>
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) { return $null }
+    try {
+        $json = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $processed = @{}
+        if ($json.processedWorkspaces) {
+            $json.processedWorkspaces.PSObject.Properties | ForEach-Object {
+                $processed[$_.Name] = $_.Value
+            }
+        }
+        return @{
+            startedAt            = $json.startedAt
+            outputPath           = $json.outputPath
+            logPath              = $json.logPath
+            errorLogPath         = $json.errorLogPath
+            useBulkExport        = $json.useBulkExport
+            workspaceFilter      = $json.workspaceFilter
+            processedWorkspaces  = $processed
+            selfAddedWorkspaces  = [System.Collections.Generic.List[string]]@(
+                @($json.selfAddedWorkspaces) | Where-Object { $_ }
+            )
+        }
+    }
+    catch {
+        Write-Warning "Could not load state file '$Path': $_"
+        return $null
+    }
+}
+
+function Test-TokenValidity {
+    <#
+    .SYNOPSIS
+        Tests if the Fabric Admin token is still valid by making a lightweight API call.
+        Returns $true if valid, $false if expired or insufficient permissions.
+    #>
+    param([hashtable]$Headers)
+
+    try {
+        $testUri = "$FabricApiBase/admin/workspaces?`$top=1"
+        $null = Invoke-RestMethod -Uri $testUri -Method GET -Headers $Headers -ErrorAction Stop
+        return $true
+    }
+    catch {
+        $sc = $null
+        if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
+        if ($sc -eq 401 -or $sc -eq 403) {
+            return $false
+        }
+        # Transient/server errors — don't falsely declare PIM expired
+        Write-Log -Message "Token validation got non-auth error (status $sc): $_ — assuming token is still valid" -Level 'WARN'
+        return $true
+    }
+}
+
+function Get-TokenExpiryMinutes {
+    <#
+    .SYNOPSIS
+        Decodes the JWT exp claim to determine how many minutes remain before the token expires.
+    #>
+    param([string]$Token)
+    try {
+        $parts = $Token.Split('.')
+        $payload = $parts[1]
+        $padding = 4 - ($payload.Length % 4)
+        if ($padding -ne 4) { $payload += ('=' * $padding) }
+        $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
+        $claims = $decoded | ConvertFrom-Json
+        $expiry = [DateTimeOffset]::FromUnixTimeSeconds($claims.exp)
+        return ($expiry - [DateTimeOffset]::UtcNow).TotalMinutes
+    }
+    catch { return 999 }
+}
+
 function Get-FabricToken {
     <#
     .SYNOPSIS
@@ -468,6 +665,12 @@ function Get-CurrentUserObjectId {
 }
 
 function Get-CurrentUserEmail {
+    <#
+    .SYNOPSIS
+        Gets the email/UPN of the current user from the JWT token.
+        Handles B2B guest accounts where the 'upn' claim may be missing or in #EXT# format.
+        Falls back through: upn → email → preferred_username → unique_name.
+    #>
     param([string]$Token)
     try {
         $parts = $Token.Split('.')
@@ -476,7 +679,15 @@ function Get-CurrentUserEmail {
         if ($padding -ne 4) { $payload += ('=' * $padding) }
         $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload))
         $claims = $decoded | ConvertFrom-Json
-        return $claims.upn
+
+        # Try claims in order of reliability for identifying the user
+        if ($claims.upn) { return $claims.upn }
+        if ($claims.email) { return $claims.email }
+        if ($claims.preferred_username) { return $claims.preferred_username }
+        if ($claims.unique_name) { return $claims.unique_name }
+
+        Write-Warning "Could not find email/UPN in token claims. B2B guest tokens may require additional configuration."
+        return $null
     }
     catch {
         return $null
@@ -568,7 +779,8 @@ function Get-AllReports {
 function Add-SelfToWorkspace {
     <#
     .SYNOPSIS
-        Adds the current user as Admin to a workspace using the Power BI Admin API.
+        Adds or elevates the current user to Admin in a workspace using the Power BI Admin API.
+        If the user already has a role, POST updates it to Admin.
     #>
     param(
         [string]$WorkspaceId,
@@ -586,7 +798,7 @@ function Add-SelfToWorkspace {
 
     try {
         Invoke-FabricApi -Uri $uri -Method "POST" -Body $body -Headers $Headers
-        Write-Log -Message "ACCESS GRANTED: Added '$UserEmail' as Admin to workspace '$WorkspaceName' ($WorkspaceId)" -Level 'ACCESS'
+        Write-Log -Message "ACCESS GRANTED: Added/elevated '$UserEmail' to Admin in workspace '$WorkspaceName' ($WorkspaceId)" -Level 'ACCESS'
         return $true
     }
     catch {
@@ -595,10 +807,76 @@ function Add-SelfToWorkspace {
     }
 }
 
+function Get-UserWorkspaceRole {
+    <#
+    .SYNOPSIS
+        Gets the current user's role in a workspace, or $null if they have no access.
+        Uses the Admin API to list workspace users and find the matching entry.
+    #>
+    param(
+        [string]$WorkspaceId,
+        [string]$UserEmail,
+        [hashtable]$Headers
+    )
+
+    try {
+        $uri = "$PowerBIApiBase/admin/groups/$WorkspaceId/users"
+        $response = Invoke-FabricApi -Uri $uri -Method "GET" -Headers $Headers
+        $users = if ($response.value) { $response.value } else { @($response) }
+        $match = $users | Where-Object {
+            $_.emailAddress -eq $UserEmail -or $_.identifier -eq $UserEmail
+        }
+        if ($match) {
+            return $match.groupUserAccessRight
+        }
+        return $null
+    }
+    catch {
+        Write-Log -Message "Could not query workspace users for '$WorkspaceId': $_" -Level 'DEBUG'
+        return $null
+    }
+}
+
+function Restore-UserWorkspaceRole {
+    <#
+    .SYNOPSIS
+        Restores a user's original workspace role, or removes them if they had no prior access.
+    #>
+    param(
+        [string]$WorkspaceId,
+        [string]$WorkspaceName,
+        [string]$UserEmail,
+        [string]$OriginalRole,
+        [hashtable]$Headers
+    )
+
+    if ($OriginalRole) {
+        # User had an existing role — restore it via POST (updates the role)
+        $uri = "$PowerBIApiBase/admin/groups/$WorkspaceId/users"
+        $body = @{
+            emailAddress         = $UserEmail
+            groupUserAccessRight = $OriginalRole
+            principalType        = "User"
+        }
+        try {
+            Invoke-FabricApi -Uri $uri -Method "POST" -Body $body -Headers $Headers
+            Write-Log -Message "ACCESS RESTORED: Restored '$UserEmail' to '$OriginalRole' in workspace '$WorkspaceName' ($WorkspaceId)" -Level 'ACCESS'
+        }
+        catch {
+            Write-ErrorLog "Failed to restore role '$OriginalRole' for '$UserEmail' in workspace '$WorkspaceName' ($WorkspaceId): $_"
+        }
+    }
+    else {
+        # User had no prior access — remove them entirely
+        Remove-SelfFromWorkspace -WorkspaceId $WorkspaceId -WorkspaceName $WorkspaceName -UserEmail $UserEmail -Headers $Headers
+    }
+}
+
 function Remove-SelfFromWorkspace {
     <#
     .SYNOPSIS
         Removes the current user from a workspace using the Power BI Admin API.
+        URL-encodes the email to handle B2B guest accounts with #EXT# format UPNs.
     #>
     param(
         [string]$WorkspaceId,
@@ -607,7 +885,8 @@ function Remove-SelfFromWorkspace {
         [hashtable]$Headers
     )
 
-    $uri = "$PowerBIApiBase/admin/groups/$WorkspaceId/users/$UserEmail"
+    $encodedEmail = [System.Uri]::EscapeDataString($UserEmail)
+    $uri = "$PowerBIApiBase/admin/groups/$WorkspaceId/users/$encodedEmail"
     try {
         Invoke-FabricApi -Uri $uri -Method "DELETE" -Headers $Headers
         Write-Log -Message "ACCESS REVOKED: Removed '$UserEmail' from workspace '$WorkspaceName' ($WorkspaceId)" -Level 'ACCESS'
@@ -922,7 +1201,7 @@ function Extract-CustomVisualsFromDefinition {
         if ($foundOnPages.ContainsKey($visualGuid)) {
             foreach ($pageName in $foundOnPages[$visualGuid]) {
                 $customVisuals.Add([PSCustomObject]@{
-                    CustomVisualId = $visualGuid; CustomVisualName = $visualGuid
+                    CustomVisualId = $visualGuid
                     CustomVisualDisplayName = $meta.DisplayName; CustomVisualVersion = $meta.Version
                     CustomVisualPublisher = $meta.Publisher; CustomVisualSource = $meta.Source
                     IsCertified = $meta.IsCertified; AppSourceLink = $meta.AppSourceLink
@@ -932,7 +1211,7 @@ function Extract-CustomVisualsFromDefinition {
         }
         else {
             $customVisuals.Add([PSCustomObject]@{
-                CustomVisualId = $visualGuid; CustomVisualName = $visualGuid
+                CustomVisualId = $visualGuid
                 CustomVisualDisplayName = $meta.DisplayName; CustomVisualVersion = $meta.Version
                 CustomVisualPublisher = $meta.Publisher; CustomVisualSource = $meta.Source
                 IsCertified = $meta.IsCertified; AppSourceLink = $meta.AppSourceLink
@@ -949,8 +1228,70 @@ function Extract-CustomVisualsFromDefinition {
 #region --- Main Script ---
 
 $ErrorActionPreference = "Continue"
-# Remove existing output file so first Write-CsvRow creates it with headers
-if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
+
+# Initialize scan state for checkpoint/resume
+$scanState = @{
+    startedAt            = (Get-Date -Format "o")
+    outputPath           = $OutputPath
+    logPath              = $LogPath
+    errorLogPath         = $ErrorLogPath
+    useBulkExport        = $UseBulkExport.IsPresent
+    workspaceFilter      = $WorkspaceFilter
+    processedWorkspaces  = @{}
+    selfAddedWorkspaces  = [System.Collections.Generic.List[string]]::new()
+}
+
+# Handle resume from previous run
+if (-not $Resume) {
+    # Check for existing state files and prompt user
+    $existingStateFiles = @(Get-ChildItem -Path $PSScriptRoot -Filter "CustomVisuals_State_*.json" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    if ($existingStateFiles.Count -gt 0) {
+        $latestState = $existingStateFiles[0]
+        $stateData = Load-ScanState -Path $latestState.FullName
+        if ($stateData -and $stateData.processedWorkspaces.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  A previous scan state file was found:" -ForegroundColor Yellow
+            Write-Host "    $($latestState.FullName)" -ForegroundColor White
+            Write-Host "    Started: $($stateData.startedAt)" -ForegroundColor Gray
+            Write-Host "    Workspaces processed: $($stateData.processedWorkspaces.Count)" -ForegroundColor Gray
+            Write-Host ""
+            $answer = Read-Host "  Resume from this previous run? (Y/N)"
+            if ($answer -match '^[Yy]') {
+                $Resume = $true
+                $StateFilePath = $latestState.FullName
+                $previousState = $stateData
+            }
+        }
+    }
+}
+
+if ($Resume -and -not $previousState) {
+    # Explicit -Resume was passed but we haven't loaded state yet
+    $previousState = Load-ScanState -Path $StateFilePath
+}
+
+if ($Resume -and $previousState) {
+    $scanState.processedWorkspaces = $previousState.processedWorkspaces
+    $scanState.selfAddedWorkspaces = $previousState.selfAddedWorkspaces
+    # Reuse the same output paths so CSV is appended to
+    $OutputPath = $previousState.outputPath
+    $LogPath = $previousState.logPath
+    $ErrorLogPath = $previousState.errorLogPath
+    $scanState.outputPath = $OutputPath
+    $scanState.logPath = $LogPath
+    $scanState.errorLogPath = $ErrorLogPath
+    Write-Host "  Resuming from previous run. $($previousState.processedWorkspaces.Count) workspaces already processed." -ForegroundColor Cyan
+}
+elseif ($Resume) {
+    Write-Warning "No state file found at '$StateFilePath'. Starting fresh."
+    $Resume = $false
+}
+
+# Remove existing output file so first Write-CsvRow creates it with headers (skip on resume)
+if (-not $Resume) {
+    if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
+}
 $stats = @{
     WorkspacesTotal      = 0
     WorkspacesScanned    = 0
@@ -977,7 +1318,9 @@ Write-Log -Message "Activity Log: $LogPath" -Level 'INFO'
 Write-Log -Message "Error Log: $ErrorLogPath" -Level 'INFO'
 Write-Log -Message "AddSelfToWorkspaces: $AddSelfToWorkspaces" -Level 'INFO'
 Write-Log -Message "UseBulkExport: $UseBulkExport" -Level 'INFO'
+Write-Log -Message "State File: $StateFilePath" -Level 'INFO'
 if ($WorkspaceFilter) { Write-Log -Message "WorkspaceFilter: $WorkspaceFilter" -Level 'INFO' }
+if ($Resume) { Write-Log -Message "RESUMED from previous run. $($scanState.processedWorkspaces.Count) workspaces already processed." -Level 'INFO' }
 
 # Step 1: Authenticate
 Write-Host "[1/7] Authenticating..." -ForegroundColor Yellow
@@ -994,7 +1337,14 @@ try {
     $azContext = Get-AzContext -ErrorAction Stop
     if (-not $azContext -or -not $azContext.Account) {
         Write-Host "  No Azure context found. Signing in..." -ForegroundColor Gray
-        Connect-AzAccount -ErrorAction Stop | Out-Null
+        $connectParams = @{ ErrorAction = "Stop" }
+        if ($TenantId) { $connectParams["TenantId"] = $TenantId }
+        Connect-AzAccount @connectParams | Out-Null
+        $azContext = Get-AzContext
+    }
+    elseif ($TenantId -and $azContext.Tenant.Id -ne $TenantId) {
+        Write-Host "  Switching to tenant '$TenantId'..." -ForegroundColor Gray
+        Connect-AzAccount -TenantId $TenantId -ErrorAction Stop | Out-Null
         $azContext = Get-AzContext
     }
     else {
@@ -1003,7 +1353,9 @@ try {
 }
 catch {
     Write-Host "  Connecting to Azure..." -ForegroundColor Gray
-    Connect-AzAccount -ErrorAction Stop | Out-Null
+    $connectParams = @{ ErrorAction = "Stop" }
+    if ($TenantId) { $connectParams["TenantId"] = $TenantId }
+    Connect-AzAccount @connectParams | Out-Null
     $azContext = Get-AzContext
 }
 
@@ -1017,6 +1369,32 @@ $currentUserEmail = Get-CurrentUserEmail -Token $fabricToken
 Write-Host "  Authenticated as: $currentUserEmail (OID: $currentUserObjectId)" -ForegroundColor Green
 Write-Log -Message "Authenticated as: $currentUserEmail (OID: $currentUserObjectId)" -Level 'INFO'
 Write-Host ""
+
+# Verify admin permissions before starting (fail fast for PIM scenarios)
+Write-Host "[1.5/7] Verifying admin permissions..." -ForegroundColor Yellow
+if (-not (Test-TokenValidity -Headers $fabricHeaders)) {
+    Write-Host "  ERROR: Your account does not appear to have Fabric Admin permissions." -ForegroundColor Red
+    Write-Host "  If using PIM, ensure you have activated the Fabric Administrator role." -ForegroundColor Yellow
+    throw "Insufficient admin permissions. Activate PIM role and retry."
+}
+$tokenExpiryMin = Get-TokenExpiryMinutes -Token $fabricToken
+Write-Host "  Admin permissions verified. Token expires in $([Math]::Round($tokenExpiryMin, 0)) minutes." -ForegroundColor Green
+Write-Log -Message "Admin permissions verified. Token expires in $([Math]::Round($tokenExpiryMin, 0)) minutes." -Level 'INFO'
+Write-Host ""
+
+# Clean up self-added workspaces from a previous interrupted run
+if ($Resume -and $previousState -and $previousState.selfAddedWorkspaces.Count -gt 0) {
+    Write-Host "  Cleaning up $($previousState.selfAddedWorkspaces.Count) workspace(s) where admin was added in previous run..." -ForegroundColor Yellow
+    foreach ($wsId in $previousState.selfAddedWorkspaces) {
+        try {
+            Remove-SelfFromWorkspace -WorkspaceId $wsId -WorkspaceName "(from previous run)" -UserEmail $currentUserEmail -Headers $pbiHeaders
+        }
+        catch {
+            Write-ErrorLog "Failed to cleanup workspace $wsId from previous run: $_"
+        }
+    }
+    Write-Host "  Cleanup complete." -ForegroundColor Green
+}
 
 # Track token refresh time
 $tokenRefreshTime = Get-Date
@@ -1123,7 +1501,6 @@ foreach ($ws in $personalWorkspaces) {
                 ReportUrl               = "https://app.fabric.microsoft.com/groups/$($ws.id)/reports/$($report.id)"
                 ScanStatus              = "Skipped_PersonalWorkspace"
                 CustomVisualId          = ""
-                                    CustomVisualName        = ""
                 CustomVisualDisplayName = ""
                 CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1152,11 +1529,44 @@ Write-Host ""
 # Step 6: Process each workspace
 $workspaceIndex = 0
 $workspacesAddedSelf = [System.Collections.Generic.List[string]]::new()
+$pimExpired = $false
 
+try {
 foreach ($workspace in $workspacesToScan) {
     $workspaceIndex++
     $wsReports = $reportsByWorkspace[$workspace.id]
     $percentComplete = [Math]::Floor(($workspaceIndex / $workspacesToScan.Count) * 100)
+
+    # Skip already-processed workspaces (resume support)
+    if ($scanState.processedWorkspaces.ContainsKey($workspace.id)) {
+        $previousStatus = $scanState.processedWorkspaces[$workspace.id]
+        # Re-attempt AccessDenied workspaces if -AddSelfToWorkspaces is now enabled
+        if ($previousStatus -eq "AccessDenied" -and $AddSelfToWorkspaces) {
+            Write-Log -Message "Re-attempting workspace '$($workspace.name)' ($($workspace.id)) - was AccessDenied, now -AddSelfToWorkspaces is enabled" -Level 'INFO'
+        }
+        elseif ($previousStatus -eq "InProgress") {
+            # Workspace was interrupted mid-scan — clean up partial CSV rows and re-scan
+            Write-Log -Message "Re-scanning workspace '$($workspace.name)' ($($workspace.id)) - was interrupted (InProgress)" -Level 'INFO'
+            if (Test-Path $OutputPath) {
+                $csvContent = Import-Csv -Path $OutputPath
+                $cleanedContent = $csvContent | Where-Object { $_.WorkspaceId -ne $workspace.id }
+                if ($cleanedContent) {
+                    $cleanedContent | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -Force
+                }
+                else {
+                    Remove-Item $OutputPath -Force
+                }
+                $removedCount = $csvContent.Count - @($cleanedContent).Count
+                if ($removedCount -gt 0) {
+                    Write-Log -Message "Removed $removedCount partial CSV rows for workspace '$($workspace.name)'" -Level 'INFO'
+                }
+            }
+        }
+        else {
+            Write-Log -Message "Skipping workspace '$($workspace.name)' ($($workspace.id)) - already processed ($previousStatus)" -Level 'INFO'
+            continue
+        }
+    }
 
     Write-Progress -Activity "Scanning workspaces" `
         -Status "[$workspaceIndex/$($workspacesToScan.Count)] '$($workspace.name)' ($($wsReports.Count) reports)" `
@@ -1164,30 +1574,48 @@ foreach ($workspace in $workspacesToScan) {
 
     Write-Log -Message "--- Workspace [$workspaceIndex/$($workspacesToScan.Count)]: '$($workspace.name)' ($($workspace.id)) - $($wsReports.Count) reports ---" -Level 'INFO'
 
-    # Refresh token if needed (every 40 minutes)
-    if (((Get-Date) - $tokenRefreshTime).TotalMinutes -gt 40) {
-        Write-Verbose "Refreshing access tokens..."
+    # Refresh token if needed (proactive: check JWT expiry or every 40 minutes)
+    $tokenMinLeft = Get-TokenExpiryMinutes -Token $fabricToken
+    if ($tokenMinLeft -lt 10 -or ((Get-Date) - $tokenRefreshTime).TotalMinutes -gt 40) {
+        Write-Verbose "Refreshing access tokens (token expires in $([Math]::Round($tokenMinLeft, 0)) min)..."
         try {
             $fabricToken = Get-FabricToken
             $pbiToken = Get-PowerBIToken
             $fabricHeaders = Get-AuthHeaders -Token $fabricToken
             $pbiHeaders = Get-AuthHeaders -Token $pbiToken
             $tokenRefreshTime = Get-Date
+
+            # Verify the refreshed token still has admin permissions
+            if (-not (Test-TokenValidity -Headers $fabricHeaders)) {
+                Write-Warning "Token refreshed but admin permissions lost (PIM role may have expired)."
+                Write-Log -Message "ADMIN PERMISSIONS LOST after token refresh - PIM role likely expired. Saving state for resume." -Level 'ERROR'
+                $pimExpired = $true
+                break
+            }
         }
         catch {
-            Write-ErrorLog "Token refresh failed: $_"
+            Write-ErrorLog "Token refresh failed (PIM role may have expired): $_"
+            $pimExpired = $true
+            break
         }
     }
 
     $addedSelfThisWorkspace = $false
+    $originalWorkspaceRole = $null
+    $workspaceCompleted = $false
+
+    # Mark workspace as in-progress before scanning
+    $scanState.processedWorkspaces[$workspace.id] = "InProgress"
+    Save-ScanState -Path $StateFilePath -State $scanState
 
     try {
         $definitions = $null
         $accessDenied = $false
+        $wsAccessDenied = $false
         $bulkFailed = $false
 
-        if ($UseBulkExport) {
-            # --- Bulk Export approach ---
+        if ($UseBulkExport -and $workspace.capacityId) {
+            # --- Bulk Export approach (requires capacity) ---
             try {
                 $definitions = Get-BulkReportDefinitions -WorkspaceId $workspace.id -ReportIds @($wsReports.id) -Headers $fabricHeaders
             }
@@ -1196,19 +1624,27 @@ foreach ($workspace in $workspacesToScan) {
                 if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
 
                 if ($sc -eq 403 -and $AddSelfToWorkspaces) {
-                    Write-Verbose "  Access denied for workspace '$($workspace.name)'. Adding self as admin..."
+                    Write-Verbose "  Access denied for workspace '$($workspace.name)'. Checking existing role..."
+                    $originalWorkspaceRole = Get-UserWorkspaceRole -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
+                    if ($originalWorkspaceRole) {
+                        Write-Log -Message "User has existing '$originalWorkspaceRole' role in workspace '$($workspace.name)' - elevating to Admin" -Level 'ACCESS'
+                    }
                     $added = Add-SelfToWorkspace -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -Headers $pbiHeaders
                     if ($added) {
                         $addedSelfThisWorkspace = $true
                         $workspacesAddedSelf.Add($workspace.id)
-                        Start-Sleep -Seconds 5  # Wait for permission propagation
-                        # Retry
+                        $scanState.selfAddedWorkspaces.Add($workspace.id)
+                        if ($StateFilePath) { Save-ScanState -Path $StateFilePath -State $scanState }
+                        # Retry with exponential backoff polling for permission propagation
                         try {
-                            $definitions = Get-BulkReportDefinitions -WorkspaceId $workspace.id -ReportIds @($wsReports.id) -Headers $fabricHeaders
+                            $definitions = Wait-ForPermissionPropagation -Action {
+                                Get-BulkReportDefinitions -WorkspaceId $workspace.id -ReportIds @($wsReports.id) -Headers $fabricHeaders
+                            } -WorkspaceName $workspace.name -MaxWaitSeconds $PermissionWaitSeconds
                         }
                         catch {
-                            Write-ErrorLog "Bulk export failed for workspace '$($workspace.name)' even after adding self: $_"
-                            $accessDenied = $true
+                            Write-ErrorLog "Bulk export failed for workspace '$($workspace.name)' after permission propagation wait: $_"
+                            Write-Log -Message "Falling back to individual getDefinition for workspace '$($workspace.name)'" -Level 'WARN'
+                            $bulkFailed = $true
                         }
                     }
                     else {
@@ -1250,7 +1686,6 @@ foreach ($workspace in $workspacesToScan) {
                                     ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                     ScanStatus              = "Success"
                                     CustomVisualId          = $cv.CustomVisualId
-                                    CustomVisualName        = $cv.CustomVisualName
                                     CustomVisualDisplayName = $cv.CustomVisualDisplayName
                                     CustomVisualVersion     = $cv.CustomVisualVersion
                                     CustomVisualPublisher   = $cv.CustomVisualPublisher
@@ -1273,7 +1708,6 @@ foreach ($workspace in $workspacesToScan) {
                                 ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                 ScanStatus              = "Success_NoCustomVisuals"
                                 CustomVisualId          = ""
-                                CustomVisualName        = ""
                                 CustomVisualDisplayName = ""
                                 CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1299,7 +1733,6 @@ foreach ($workspace in $workspacesToScan) {
                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                             ScanStatus              = "Skipped_UnsupportedItem"
                             CustomVisualId          = ""
-                            CustomVisualName        = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1322,7 +1755,6 @@ foreach ($workspace in $workspacesToScan) {
                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                             ScanStatus              = "Error"
                             CustomVisualId          = ""
-                            CustomVisualName        = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1418,7 +1850,6 @@ foreach ($workspace in $workspacesToScan) {
                                     ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                     ScanStatus              = "Success"
                                     CustomVisualId          = $cv.CustomVisualId
-                                    CustomVisualName        = $cv.CustomVisualName
                                     CustomVisualDisplayName = $cv.CustomVisualDisplayName
                                     CustomVisualVersion     = $cv.CustomVisualVersion
                                     CustomVisualPublisher   = $cv.CustomVisualPublisher
@@ -1442,7 +1873,6 @@ foreach ($workspace in $workspacesToScan) {
                                 ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                 ScanStatus              = "Success_NoCustomVisuals"
                                 CustomVisualId          = ""
-                                    CustomVisualName        = ""
                                 CustomVisualDisplayName = ""
                                 CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1467,7 +1897,6 @@ foreach ($workspace in $workspacesToScan) {
                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                             ScanStatus              = "NotInBulkExport"
                             CustomVisualId          = ""
-                                    CustomVisualName        = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1495,7 +1924,6 @@ foreach ($workspace in $workspacesToScan) {
                         ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                         ScanStatus              = "AccessDenied"
                         CustomVisualId          = ""
-                                    CustomVisualName        = ""
                         CustomVisualDisplayName = ""
                         CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1514,6 +1942,9 @@ foreach ($workspace in $workspacesToScan) {
         }
         else {
             # --- Individual Get Definition approach ---
+            if ($UseBulkExport -and -not $workspace.capacityId) {
+                Write-Log -Message "Workspace '$($workspace.name)' has no capacity assigned (orphaned). Falling back to individual getDefinition." -Level 'WARN'
+            }
             $reportIndex = 0
             $wsAccessDenied = $false
 
@@ -1533,7 +1964,6 @@ foreach ($workspace in $workspacesToScan) {
                         ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                         ScanStatus              = "AccessDenied"
                         CustomVisualId          = ""
-                                    CustomVisualName        = ""
                         CustomVisualDisplayName = ""
                         CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1563,7 +1993,6 @@ foreach ($workspace in $workspacesToScan) {
                                 ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                 ScanStatus              = "Success"
                                 CustomVisualId          = $cv.CustomVisualId
-                                    CustomVisualName        = $cv.CustomVisualName
                                 CustomVisualDisplayName = $cv.CustomVisualDisplayName
                                 CustomVisualVersion     = $cv.CustomVisualVersion
                                     CustomVisualPublisher   = $cv.CustomVisualPublisher
@@ -1586,7 +2015,6 @@ foreach ($workspace in $workspacesToScan) {
                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                             ScanStatus              = "Success_NoCustomVisuals"
                             CustomVisualId          = ""
-                                    CustomVisualName        = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1611,7 +2039,6 @@ foreach ($workspace in $workspacesToScan) {
                         ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                         ScanStatus              = "Skipped_UnsupportedItem"
                         CustomVisualId          = ""
-                        CustomVisualName        = ""
                         CustomVisualDisplayName = ""
                         CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1628,15 +2055,22 @@ foreach ($workspace in $workspacesToScan) {
                     if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
 
                     if ($sc -eq 403 -and $AddSelfToWorkspaces -and -not $addedSelfThisWorkspace) {
-                        Write-Verbose "  Access denied. Adding self as admin to '$($workspace.name)'..."
+                        Write-Verbose "  Access denied. Checking existing role in '$($workspace.name)'..."
+                        $originalWorkspaceRole = Get-UserWorkspaceRole -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
+                        if ($originalWorkspaceRole) {
+                            Write-Log -Message "User has existing '$originalWorkspaceRole' role in workspace '$($workspace.name)' - elevating to Admin" -Level 'ACCESS'
+                        }
                         $added = Add-SelfToWorkspace -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -Headers $pbiHeaders
                         if ($added) {
                             $addedSelfThisWorkspace = $true
                             $workspacesAddedSelf.Add($workspace.id)
-                            Start-Sleep -Seconds 5
-                            # Retry this report
+                            $scanState.selfAddedWorkspaces.Add($workspace.id)
+                            if ($StateFilePath) { Save-ScanState -Path $StateFilePath -State $scanState }
+                            # Retry this report with exponential backoff polling
                             try {
-                                $definition = Get-ReportDefinition -WorkspaceId $workspace.id -ReportId $report.id -Headers $fabricHeaders
+                                $definition = Wait-ForPermissionPropagation -Action {
+                                    Get-ReportDefinition -WorkspaceId $workspace.id -ReportId $report.id -Headers $fabricHeaders
+                                } -WorkspaceName $workspace.name -MaxWaitSeconds $PermissionWaitSeconds
                                 $parsed = Extract-CustomVisualsFromDefinition -Definition $definition -ReportId $report.id -AppSourceLookup $appSourceLookup
 
                                 if ($parsed.Visuals.Count -gt 0) {
@@ -1650,7 +2084,6 @@ foreach ($workspace in $workspacesToScan) {
                                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                             ScanStatus              = "Success"
                                             CustomVisualId          = $cv.CustomVisualId
-                                    CustomVisualName        = $cv.CustomVisualName
                                             CustomVisualDisplayName = $cv.CustomVisualDisplayName
                                             CustomVisualVersion     = $cv.CustomVisualVersion
                                     CustomVisualPublisher   = $cv.CustomVisualPublisher
@@ -1673,7 +2106,6 @@ foreach ($workspace in $workspacesToScan) {
                                         ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                         ScanStatus              = "Success_NoCustomVisuals"
                                         CustomVisualId          = ""
-                                    CustomVisualName        = ""
                                         CustomVisualDisplayName = ""
                                         CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1698,7 +2130,6 @@ foreach ($workspace in $workspacesToScan) {
                                     ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                     ScanStatus              = "Skipped_UnsupportedItem"
                                     CustomVisualId          = ""
-                                    CustomVisualName        = ""
                                     CustomVisualDisplayName = ""
                                     CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1721,7 +2152,6 @@ foreach ($workspace in $workspacesToScan) {
                                     ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                     ScanStatus              = "Error"
                                     CustomVisualId          = ""
-                                    CustomVisualName        = ""
                                     CustomVisualDisplayName = ""
                                     CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1746,7 +2176,6 @@ foreach ($workspace in $workspacesToScan) {
                                 ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                                 ScanStatus              = "AccessDenied"
                                 CustomVisualId          = ""
-                                    CustomVisualName        = ""
                                 CustomVisualDisplayName = ""
                                 CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1772,7 +2201,6 @@ foreach ($workspace in $workspacesToScan) {
                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                             ScanStatus              = "AccessDenied"
                             CustomVisualId          = ""
-                                    CustomVisualName        = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1796,7 +2224,6 @@ foreach ($workspace in $workspacesToScan) {
                             ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
                             ScanStatus              = "Error"
                             CustomVisualId          = ""
-                                    CustomVisualName        = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
                                     CustomVisualPublisher   = ""
@@ -1823,14 +2250,55 @@ foreach ($workspace in $workspacesToScan) {
 
             Write-Progress -Id 1 -Activity "Processing reports" -Completed
         }
+        $workspaceCompleted = $true
     }
     finally {
-        # Cleanup: remove self from workspace if added
-        if ($addedSelfThisWorkspace) {
-            Write-Verbose "  Removing self from workspace '$($workspace.name)'..."
-            Remove-SelfFromWorkspace -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -Headers $pbiHeaders
+        # Determine workspace status for checkpoint — only finalize if processing completed
+        if ($workspaceCompleted) {
+            $workspaceStatus = "Success"
+            if ($accessDenied -or $wsAccessDenied) { $workspaceStatus = "AccessDenied" }
         }
+        else {
+            # Interrupted mid-scan — leave as InProgress for resume
+            $workspaceStatus = "InProgress"
+        }
+
+        # Cleanup: restore original role or remove self from workspace
+        if ($addedSelfThisWorkspace) {
+            Write-Verbose "  Restoring access in workspace '$($workspace.name)'..."
+            Restore-UserWorkspaceRole -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -OriginalRole $originalWorkspaceRole -Headers $pbiHeaders
+            $scanState.selfAddedWorkspaces = [System.Collections.Generic.List[string]]@(
+                $scanState.selfAddedWorkspaces | Where-Object { $_ -ne $workspace.id }
+            )
+        }
+
+        # Checkpoint: save progress after each workspace
+        $scanState.processedWorkspaces[$workspace.id] = $workspaceStatus
+        Save-ScanState -Path $StateFilePath -State $scanState
     }
+}
+} # end try (outer workspace loop)
+finally {
+    # Always save state on exit (normal or interrupted) for resume capability
+    Save-ScanState -Path $StateFilePath -State $scanState
+}
+
+# Handle PIM expiration
+if ($pimExpired) {
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host "  SCAN INTERRUPTED - Admin permissions lost" -ForegroundColor Red
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host "  PIM role appears to have expired. Progress saved." -ForegroundColor Yellow
+    Write-Host "  Processed $($scanState.processedWorkspaces.Count)/$($workspacesToScan.Count) workspaces before interruption." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  To resume:" -ForegroundColor Cyan
+    Write-Host "    1. Re-activate your PIM role" -ForegroundColor White
+    Write-Host "    2. Run: Connect-AzAccount" -ForegroundColor White
+    Write-Host "    3. Run: .\Get-CustomVisuals.ps1 -Resume -StateFilePath '$StateFilePath' $(if ($UseBulkExport) { '-UseBulkExport' }) $(if ($AddSelfToWorkspaces) { '-AddSelfToWorkspaces' })" -ForegroundColor White
+    Write-Host "================================================================" -ForegroundColor Red
+    Write-Host ""
+    Write-Log -Message "Scan interrupted due to PIM expiration. $($scanState.processedWorkspaces.Count)/$($workspacesToScan.Count) workspaces processed." -Level 'ERROR'
 }
 
 Write-Progress -Activity "Scanning workspaces" -Completed
@@ -1862,6 +2330,24 @@ Write-Host "  Output: $OutputPath" -ForegroundColor White
 if (Test-Path $ErrorLogPath) {
     Write-Host "  Errors: $ErrorLogPath" -ForegroundColor Yellow
 }
+
+# Clean up or preserve state file based on completion status
+$allProcessed = $scanState.processedWorkspaces.Count -ge $workspacesToScan.Count
+$hasFailures = ($scanState.processedWorkspaces.Values | Where-Object { $_ -ne "Success" }).Count -gt 0
+if (-not $pimExpired -and $allProcessed -and -not $hasFailures) {
+    # Full success — remove state file
+    if (Test-Path $StateFilePath) {
+        Remove-Item $StateFilePath -Force
+        Write-Log -Message "Scan complete. State file removed." -Level 'INFO'
+    }
+}
+elseif (-not $pimExpired) {
+    Write-Host "  State file: $StateFilePath" -ForegroundColor Yellow
+    if ($hasFailures) {
+        Write-Host "  Some workspaces had errors or were access denied. Resume with -Resume to retry." -ForegroundColor Yellow
+    }
+}
+
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host ""
 

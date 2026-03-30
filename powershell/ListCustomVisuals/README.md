@@ -87,6 +87,46 @@ Only scans workspaces whose names match the wildcard pattern.
                         -ErrorLogPath "C:\Reports\errors.log"
 ```
 
+### Resuming a scan (PIM / interrupted runs)
+
+The script automatically creates a state file that tracks which workspaces have been processed. If the scan is interrupted — for example, because a PIM (Privileged Identity Management) admin role expires — you can resume from where it left off:
+
+```powershell
+# Step 1: Re-activate your PIM role and re-authenticate
+Connect-AzAccount
+
+# Step 2: Resume using the state file from the interrupted run
+.\Get-CustomVisuals.ps1 -Resume -StateFilePath ".\CustomVisuals_State_20260320_101500.json" `
+                        -UseBulkExport -AddSelfToWorkspaces
+```
+
+The script will:
+1. Load progress from the state file
+2. Skip already-processed workspaces
+3. Clean up any workspace permissions left from the previous interrupted run
+4. Continue scanning the remaining workspaces
+5. Append results to the existing CSV
+
+On successful completion, the state file is automatically deleted. If some workspaces had errors, the state file is preserved so you can resume again.
+
+### Adjusting permission wait time
+
+If you find that workspace permissions take longer to propagate in your tenant (common in large environments), increase the wait time:
+
+```powershell
+.\Get-CustomVisuals.ps1 -AddSelfToWorkspaces -PermissionWaitSeconds 600
+```
+
+The default is 300 seconds (5 minutes) with exponential backoff polling.
+
+### B2B guest admin (cross-tenant)
+
+If you are a B2B guest admin scanning another organization's tenant, use `-TenantId` to authenticate against the target tenant:
+
+```powershell
+.\Get-CustomVisuals.ps1 -TenantId "contoso.onmicrosoft.com" -UseBulkExport -AddSelfToWorkspaces
+```
+
 ## Parameters
 
 | Parameter | Type | Description |
@@ -96,7 +136,11 @@ Only scans workspaces whose names match the wildcard pattern.
 | `-ErrorLogPath` | String | Path for the error log. Default: `CustomVisuals_Errors_<timestamp>.log` in current directory |
 | `-AddSelfToWorkspaces` | Switch | Temporarily add/remove executing user as Admin to workspaces for access |
 | `-WorkspaceFilter` | String | Filter workspaces by name (supports `*` and `?` wildcards) |
+| `-TenantId` | String | Azure AD tenant ID or domain for cross-tenant / B2B guest scenarios |
 | `-UseBulkExport` | Switch | Use the Bulk Export Item Definitions (beta) API instead of individual calls |
+| `-PermissionWaitSeconds` | Int | Max seconds to wait for permission propagation after adding self to a workspace. Default: `300` (5 minutes) |
+| `-Resume` | Switch | Resume a previously interrupted scan, skipping already-processed workspaces |
+| `-StateFilePath` | String | Path to the JSON state file for checkpoint/resume. Auto-generated alongside the CSV if not specified |
 
 ## Output
 
@@ -112,7 +156,6 @@ Only scans workspaces whose names match the wildcard pattern.
 | `ReportUrl` | Direct URL to the report in the Fabric portal |
 | `ScanStatus` | `Success`, `Success_NoCustomVisuals`, `Skipped_PersonalWorkspace`, `AccessDenied`, `Error`, `NotInBulkExport` |
 | `CustomVisualId` | Internal identifier / GUID of the custom visual |
-| `CustomVisualName` | Technical name of the custom visual |
 | `CustomVisualDisplayName` | Human-readable display name (from AppSource catalog if available) |
 | `CustomVisualVersion` | Version string of the custom visual |
 | `CustomVisualPublisher` | Publisher name (from AppSource catalog) |
@@ -213,7 +256,10 @@ The module automatically handles 429 (Too Many Requests) responses with retry lo
 | Many `AccessDenied` reports | Use `-AddSelfToWorkspaces` switch |
 | Bulk export returns 404 | The beta API may not be available; remove `-UseBulkExport` |
 | Script runs slowly | Use `-UseBulkExport` for batch processing; use `-WorkspaceFilter` to limit scope |
-| Token expiry during long runs | The module auto-refreshes tokens every 40 minutes |
+| Token expiry during long runs | The script proactively checks token expiry and refreshes before it expires |
+| PIM role expires mid-scan | The script detects this, saves state, and prints resume instructions. Re-activate PIM, re-authenticate, then run with `-Resume -StateFilePath <path>` |
+| Permission propagation timeout | Increase `-PermissionWaitSeconds` (default: 300). Large tenants may need 600+ seconds |
+| Script interrupted (Ctrl+C) | State is saved automatically. Resume with `-Resume -StateFilePath <path>` |
 
 ## License
 
