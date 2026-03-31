@@ -209,6 +209,10 @@ function Wait-ForPermissionPropagation {
                 # Bulk export returns UnknownError while permissions are still propagating
                 $isPermissionError = $true
             }
+            elseif ($_.Exception -is [System.Net.WebException] -and $_.Exception.Message -match 'Access not yet propagated') {
+                # Thrown by Test-WorkspaceAccess pre-check during propagation wait
+                $isPermissionError = $true
+            }
 
             if (-not $isPermissionError) {
                 # Genuine non-permission error — dismiss progress and rethrow
@@ -837,6 +841,39 @@ function Get-UserWorkspaceRole {
     }
 }
 
+function Test-WorkspaceAccess {
+    <#
+    .SYNOPSIS
+        Tests the current user's effective access to a workspace by calling the
+        non-admin Get Group Users API (GET /groups/{id}/users) and finding the
+        user's role. Returns the role name (Admin, Member, Contributor, Viewer)
+        or $null if the user has no access.
+        Note: getDefinition requires at least Member access.
+    #>
+    param(
+        [string]$WorkspaceId,
+        [string]$UserEmail,
+        [hashtable]$Headers
+    )
+
+    try {
+        $uri = "$PowerBIApiBase/groups/$WorkspaceId/users"
+        $response = Invoke-RestMethod -Uri $uri -Method GET -Headers $Headers -ErrorAction Stop
+        $users = if ($response.value) { $response.value } else { @($response) }
+        $match = $users | Where-Object {
+            $_.emailAddress -eq $UserEmail -or $_.identifier -eq $UserEmail
+        }
+        if ($match) {
+            return $match.groupUserAccessRight
+        }
+        # User can list workspace users but isn't in the list (unlikely but possible)
+        return "Unknown"
+    }
+    catch {
+        return $null
+    }
+}
+
 function Restore-UserWorkspaceRole {
     <#
     .SYNOPSIS
@@ -1254,7 +1291,11 @@ if (-not $Resume) {
             Write-Host "  A previous scan state file was found:" -ForegroundColor Yellow
             Write-Host "    $($latestState.FullName)" -ForegroundColor White
             Write-Host "    Started: $($stateData.startedAt)" -ForegroundColor Gray
-            Write-Host "    Workspaces processed: $($stateData.processedWorkspaces.Count)" -ForegroundColor Gray
+            if ($stateData.workspaceFilter) {
+                Write-Host "    Workspace filter: '$($stateData.workspaceFilter)'" -ForegroundColor Gray
+            }
+            $stateSuccessCount = @($stateData.processedWorkspaces.Values | Where-Object { $_ -eq "Success" }).Count
+            Write-Host "    Workspaces completed: $stateSuccessCount" -ForegroundColor Gray
             Write-Host ""
             $answer = Read-Host "  Resume from this previous run? (Y/N)"
             if ($answer -match '^[Yy]') {
@@ -1281,7 +1322,10 @@ if ($Resume -and $previousState) {
     $scanState.outputPath = $OutputPath
     $scanState.logPath = $LogPath
     $scanState.errorLogPath = $ErrorLogPath
-    Write-Host "  Resuming from previous run. $($previousState.processedWorkspaces.Count) workspaces already processed." -ForegroundColor Cyan
+    $successCount = @($previousState.processedWorkspaces.Values | Where-Object { $_ -eq "Success" }).Count
+    $resumeMsg = "  Resuming from previous run. $successCount workspaces successfully completed."
+    if ($previousState.workspaceFilter) { $resumeMsg += " (WorkspaceFilter: '$($previousState.workspaceFilter)')" }
+    Write-Host $resumeMsg -ForegroundColor Cyan
 }
 elseif ($Resume) {
     Write-Warning "No state file found at '$StateFilePath'. Starting fresh."
@@ -1320,7 +1364,10 @@ Write-Log -Message "AddSelfToWorkspaces: $AddSelfToWorkspaces" -Level 'INFO'
 Write-Log -Message "UseBulkExport: $UseBulkExport" -Level 'INFO'
 Write-Log -Message "State File: $StateFilePath" -Level 'INFO'
 if ($WorkspaceFilter) { Write-Log -Message "WorkspaceFilter: $WorkspaceFilter" -Level 'INFO' }
-if ($Resume) { Write-Log -Message "RESUMED from previous run. $($scanState.processedWorkspaces.Count) workspaces already processed." -Level 'INFO' }
+if ($Resume) {
+    $resumeSuccessCount = @($scanState.processedWorkspaces.Values | Where-Object { $_ -eq "Success" }).Count
+    Write-Log -Message "RESUMED from previous run. $resumeSuccessCount workspaces successfully completed." -Level 'INFO'
+}
 
 # Step 1: Authenticate
 Write-Host "[1/7] Authenticating..." -ForegroundColor Yellow
@@ -1614,53 +1661,73 @@ foreach ($workspace in $workspacesToScan) {
         $wsAccessDenied = $false
         $bulkFailed = $false
 
+        # Pre-check: verify effective workspace access before attempting definition APIs
+        # getDefinition requires at least Member role (Viewer and Contributor are insufficient)
+        $sufficientRoles = @("Admin", "Member")
+        $effectiveRole = Test-WorkspaceAccess -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
+        if ($effectiveRole -and $effectiveRole -in $sufficientRoles) {
+            Write-Log -Message "User has effective '$effectiveRole' role in workspace '$($workspace.name)'" -Level 'INFO'
+        }
+        else {
+            if ($effectiveRole) {
+                Write-Log -Message "User has '$effectiveRole' role in workspace '$($workspace.name)' - insufficient for getDefinition (need Member or Admin)" -Level 'INFO'
+            }
+            else {
+                Write-Log -Message "User does not have effective access to workspace '$($workspace.name)'" -Level 'INFO'
+            }
+            if ($AddSelfToWorkspaces) {
+                # Capture existing role before elevating (for restoration later)
+                $originalWorkspaceRole = Get-UserWorkspaceRole -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
+                if ($originalWorkspaceRole) {
+                    Write-Log -Message "User has existing '$originalWorkspaceRole' role (via admin API) in workspace '$($workspace.name)' - elevating to Admin" -Level 'ACCESS'
+                }
+                $added = Add-SelfToWorkspace -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -Headers $pbiHeaders
+                if ($added) {
+                    $addedSelfThisWorkspace = $true
+                    $workspacesAddedSelf.Add($workspace.id)
+                    $scanState.selfAddedWorkspaces.Add($workspace.id)
+                    if ($StateFilePath) { Save-ScanState -Path $StateFilePath -State $scanState }
+
+                    # Wait for permission propagation — poll until user has Admin role
+                    $hasAccess = $false
+                    try {
+                        $null = Wait-ForPermissionPropagation -Action {
+                            $role = Test-WorkspaceAccess -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
+                            if (-not $role -or $role -notin $sufficientRoles) {
+                                throw [System.Net.WebException]::new("Access not yet propagated (current role: $role)")
+                            }
+                            return $true
+                        } -WorkspaceName $workspace.name -MaxWaitSeconds $PermissionWaitSeconds
+                        $hasAccess = $true
+                        Write-Log -Message "Permission propagation confirmed for workspace '$($workspace.name)'" -Level 'ACCESS'
+                    }
+                    catch {
+                        Write-ErrorLog "Permission propagation timed out for workspace '$($workspace.name)': $_"
+                    }
+                }
+
+                if (-not $hasAccess) {
+                    $accessDenied = $true
+                }
+            }
+            else {
+                $accessDenied = $true
+                Write-ErrorLog "Access denied for workspace '$($workspace.name)' (role: $effectiveRole). Use -AddSelfToWorkspaces to auto-grant access."
+            }
+        }
+
+        # Skip definition calls if we don't have access
+        if (-not $accessDenied) {
         if ($UseBulkExport -and $workspace.capacityId) {
             # --- Bulk Export approach (requires capacity) ---
             try {
                 $definitions = Get-BulkReportDefinitions -WorkspaceId $workspace.id -ReportIds @($wsReports.id) -Headers $fabricHeaders
             }
             catch {
-                $sc = $null
-                if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
-
-                if ($sc -eq 403 -and $AddSelfToWorkspaces) {
-                    Write-Verbose "  Access denied for workspace '$($workspace.name)'. Checking existing role..."
-                    $originalWorkspaceRole = Get-UserWorkspaceRole -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
-                    if ($originalWorkspaceRole) {
-                        Write-Log -Message "User has existing '$originalWorkspaceRole' role in workspace '$($workspace.name)' - elevating to Admin" -Level 'ACCESS'
-                    }
-                    $added = Add-SelfToWorkspace -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -Headers $pbiHeaders
-                    if ($added) {
-                        $addedSelfThisWorkspace = $true
-                        $workspacesAddedSelf.Add($workspace.id)
-                        $scanState.selfAddedWorkspaces.Add($workspace.id)
-                        if ($StateFilePath) { Save-ScanState -Path $StateFilePath -State $scanState }
-                        # Retry with exponential backoff polling for permission propagation
-                        try {
-                            $definitions = Wait-ForPermissionPropagation -Action {
-                                Get-BulkReportDefinitions -WorkspaceId $workspace.id -ReportIds @($wsReports.id) -Headers $fabricHeaders
-                            } -WorkspaceName $workspace.name -MaxWaitSeconds $PermissionWaitSeconds
-                        }
-                        catch {
-                            Write-ErrorLog "Bulk export failed for workspace '$($workspace.name)' after permission propagation wait: $_"
-                            Write-Log -Message "Falling back to individual getDefinition for workspace '$($workspace.name)'" -Level 'WARN'
-                            $bulkFailed = $true
-                        }
-                    }
-                    else {
-                        $accessDenied = $true
-                    }
-                }
-                elseif ($sc -eq 403) {
-                    $accessDenied = $true
-                    Write-ErrorLog "Access denied for workspace '$($workspace.name)'. Use -AddSelfToWorkspaces to auto-grant access."
-                }
-                else {
-                    # Bulk export failed (UnknownError, transient issue, etc.) - fall back to individual getDefinition
-                    Write-Warning "Bulk export failed for workspace '$($workspace.name)'. Falling back to individual report definitions..."
-                    Write-Log -Message "Bulk export failed for workspace '$($workspace.name)': $_ - falling back to individual getDefinition" -Level 'WARN'
-                    $bulkFailed = $true
-                }
+                # Bulk export failed — fall back to individual getDefinition
+                Write-Warning "Bulk export failed for workspace '$($workspace.name)'. Falling back to individual report definitions..."
+                Write-Log -Message "Bulk export failed for workspace '$($workspace.name)': $_ - falling back to individual getDefinition" -Level 'WARN'
+                $bulkFailed = $true
             }
 
             # --- Fallback: individual getDefinition when bulk export failed ---
@@ -1913,32 +1980,6 @@ foreach ($workspace in $workspacesToScan) {
                 $stats.WorkspacesScanned++
                 Write-Log -Message "Workspace '$($workspace.name)' scan complete" -Level 'INFO'
             }
-            elseif ($accessDenied) {
-                foreach ($report in $wsReports) {
-                    Write-CsvRow ([PSCustomObject]@{
-                        WorkspaceName           = $workspace.name
-                        WorkspaceId             = $workspace.id
-                        WorkspaceType           = "Workspace"
-                        ReportName              = $report.name
-                        ReportId                = $report.id
-                        ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
-                        ScanStatus              = "AccessDenied"
-                        CustomVisualId          = ""
-                        CustomVisualDisplayName = ""
-                        CustomVisualVersion     = ""
-                                    CustomVisualPublisher   = ""
-                                    CustomVisualSource      = ""
-                                    AppSourceLink           = ""
-                                    PageName                = ""
-                                    IsCertified             = ""
-                        DefinitionFormat        = ""
-                    })
-                    $stats.ReportsSkipped++
-                        Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped" -Level 'WARN'
-                }
-                $stats.WorkspacesAccessErr++
-                Write-Log -Message "Workspace '$($workspace.name)' - access denied" -Level 'WARN'
-            }
         }
         else {
             # --- Individual Get Definition approach ---
@@ -2054,144 +2095,9 @@ foreach ($workspace in $workspacesToScan) {
                     $sc = $null
                     if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
 
-                    if ($sc -eq 403 -and $AddSelfToWorkspaces -and -not $addedSelfThisWorkspace) {
-                        Write-Verbose "  Access denied. Checking existing role in '$($workspace.name)'..."
-                        $originalWorkspaceRole = Get-UserWorkspaceRole -WorkspaceId $workspace.id -UserEmail $currentUserEmail -Headers $pbiHeaders
-                        if ($originalWorkspaceRole) {
-                            Write-Log -Message "User has existing '$originalWorkspaceRole' role in workspace '$($workspace.name)' - elevating to Admin" -Level 'ACCESS'
-                        }
-                        $added = Add-SelfToWorkspace -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -Headers $pbiHeaders
-                        if ($added) {
-                            $addedSelfThisWorkspace = $true
-                            $workspacesAddedSelf.Add($workspace.id)
-                            $scanState.selfAddedWorkspaces.Add($workspace.id)
-                            if ($StateFilePath) { Save-ScanState -Path $StateFilePath -State $scanState }
-                            # Retry this report with exponential backoff polling
-                            try {
-                                $definition = Wait-ForPermissionPropagation -Action {
-                                    Get-ReportDefinition -WorkspaceId $workspace.id -ReportId $report.id -Headers $fabricHeaders
-                                } -WorkspaceName $workspace.name -MaxWaitSeconds $PermissionWaitSeconds
-                                $parsed = Extract-CustomVisualsFromDefinition -Definition $definition -ReportId $report.id -AppSourceLookup $appSourceLookup
-
-                                if ($parsed.Visuals.Count -gt 0) {
-                                    foreach ($cv in $parsed.Visuals) {
-                                        Write-CsvRow ([PSCustomObject]@{
-                                            WorkspaceName           = $workspace.name
-                                            WorkspaceId             = $workspace.id
-                                            WorkspaceType           = "Workspace"
-                                            ReportName              = $report.name
-                                            ReportId                = $report.id
-                                            ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
-                                            ScanStatus              = "Success"
-                                            CustomVisualId          = $cv.CustomVisualId
-                                            CustomVisualDisplayName = $cv.CustomVisualDisplayName
-                                            CustomVisualVersion     = $cv.CustomVisualVersion
-                                    CustomVisualPublisher   = $cv.CustomVisualPublisher
-                                    CustomVisualSource      = $cv.CustomVisualSource
-                                    AppSourceLink           = $cv.AppSourceLink
-                                    PageName                = $cv.PageName
-                                    IsCertified             = $cv.IsCertified
-                                            DefinitionFormat        = $parsed.Format
-                                        })
-                                        $stats.CustomVisualsFound++
-                                    }
-                                }
-                                else {
-                                    Write-CsvRow ([PSCustomObject]@{
-                                        WorkspaceName           = $workspace.name
-                                        WorkspaceId             = $workspace.id
-                                        WorkspaceType           = "Workspace"
-                                        ReportName              = $report.name
-                                        ReportId                = $report.id
-                                        ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
-                                        ScanStatus              = "Success_NoCustomVisuals"
-                                        CustomVisualId          = ""
-                                        CustomVisualDisplayName = ""
-                                        CustomVisualVersion     = ""
-                                    CustomVisualPublisher   = ""
-                                    CustomVisualSource      = ""
-                                    AppSourceLink           = ""
-                                    PageName                = ""
-                                    IsCertified             = ""
-                                        DefinitionFormat        = $parsed.Format
-                                    })
-                                }
-                                $stats.ReportsScanned++
-                        Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Scanned successfully, $($parsed.Visuals.Count) custom visual(s) found" -Level 'INFO'
-                            }
-                            catch [System.IO.FileNotFoundException] {
-                                Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped (app report or unsupported item)" -Level 'WARN'
-                                Write-CsvRow ([PSCustomObject]@{
-                                    WorkspaceName           = $workspace.name
-                                    WorkspaceId             = $workspace.id
-                                    WorkspaceType           = "Workspace"
-                                    ReportName              = $report.name
-                                    ReportId                = $report.id
-                                    ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
-                                    ScanStatus              = "Skipped_UnsupportedItem"
-                                    CustomVisualId          = ""
-                                    CustomVisualDisplayName = ""
-                                    CustomVisualVersion     = ""
-                                    CustomVisualPublisher   = ""
-                                    CustomVisualSource      = ""
-                                    AppSourceLink           = ""
-                                    PageName                = ""
-                                    IsCertified             = ""
-                                    DefinitionFormat        = ""
-                                })
-                                $stats.ReportsSkipped++
-                            }
-                            catch {
-                                Write-ErrorLog "Failed to get definition for report '$($report.name)' even after adding self: $_"
-                                Write-CsvRow ([PSCustomObject]@{
-                                    WorkspaceName           = $workspace.name
-                                    WorkspaceId             = $workspace.id
-                                    WorkspaceType           = "Workspace"
-                                    ReportName              = $report.name
-                                    ReportId                = $report.id
-                                    ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
-                                    ScanStatus              = "Error"
-                                    CustomVisualId          = ""
-                                    CustomVisualDisplayName = ""
-                                    CustomVisualVersion     = ""
-                                    CustomVisualPublisher   = ""
-                                    CustomVisualSource      = ""
-                                    AppSourceLink           = ""
-                                    PageName                = ""
-                                    IsCertified             = ""
-                                    DefinitionFormat        = ""
-                                })
-                                $stats.ReportsErrored++
-                        Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Error during processing" -Level 'ERROR'
-                            }
-                        }
-                        else {
-                            $wsAccessDenied = $true
-                            Write-CsvRow ([PSCustomObject]@{
-                                WorkspaceName           = $workspace.name
-                                WorkspaceId             = $workspace.id
-                                WorkspaceType           = "Workspace"
-                                ReportName              = $report.name
-                                ReportId                = $report.id
-                                ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
-                                ScanStatus              = "AccessDenied"
-                                CustomVisualId          = ""
-                                CustomVisualDisplayName = ""
-                                CustomVisualVersion     = ""
-                                    CustomVisualPublisher   = ""
-                                    CustomVisualSource      = ""
-                                    AppSourceLink           = ""
-                                    PageName                = ""
-                                    IsCertified             = ""
-                                DefinitionFormat        = ""
-                            })
-                            $stats.ReportsSkipped++
-                        Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped" -Level 'WARN'
-                        }
-                    }
-                    elseif ($sc -eq 403) {
+                    if ($sc -eq 403) {
                         $wsAccessDenied = $true
-                        Write-ErrorLog "Access denied for workspace '$($workspace.name)'. Use -AddSelfToWorkspaces to auto-grant."
+                        Write-ErrorLog "Access denied for report '$($report.name)' in workspace '$($workspace.name)' (status $sc)"
                         Write-CsvRow ([PSCustomObject]@{
                             WorkspaceName           = $workspace.name
                             WorkspaceId             = $workspace.id
@@ -2203,15 +2109,15 @@ foreach ($workspace in $workspacesToScan) {
                             CustomVisualId          = ""
                             CustomVisualDisplayName = ""
                             CustomVisualVersion     = ""
-                                    CustomVisualPublisher   = ""
-                                    CustomVisualSource      = ""
-                                    AppSourceLink           = ""
-                                    PageName                = ""
-                                    IsCertified             = ""
+                            CustomVisualPublisher   = ""
+                            CustomVisualSource      = ""
+                            AppSourceLink           = ""
+                            PageName                = ""
+                            IsCertified             = ""
                             DefinitionFormat        = ""
                         })
                         $stats.ReportsSkipped++
-                        Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped" -Level 'WARN'
+                        Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Access denied" -Level 'WARN'
                     }
                     else {
                         Write-ErrorLog "Error getting definition for report '$($report.name)' in '$($workspace.name)': $_"
@@ -2249,6 +2155,34 @@ foreach ($workspace in $workspacesToScan) {
             }
 
             Write-Progress -Id 1 -Activity "Processing reports" -Completed
+        }
+        } # end if (-not $accessDenied)
+        else {
+            # Access denied — write all reports as skipped
+            foreach ($report in $wsReports) {
+                Write-CsvRow ([PSCustomObject]@{
+                    WorkspaceName           = $workspace.name
+                    WorkspaceId             = $workspace.id
+                    WorkspaceType           = "Workspace"
+                    ReportName              = $report.name
+                    ReportId                = $report.id
+                    ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
+                    ScanStatus              = "AccessDenied"
+                    CustomVisualId          = ""
+                    CustomVisualDisplayName = ""
+                    CustomVisualVersion     = ""
+                    CustomVisualPublisher   = ""
+                    CustomVisualSource      = ""
+                    AppSourceLink           = ""
+                    PageName                = ""
+                    IsCertified             = ""
+                    DefinitionFormat        = ""
+                })
+                $stats.ReportsSkipped++
+                Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped (no workspace access)" -Level 'WARN'
+            }
+            $stats.WorkspacesAccessErr++
+            Write-Log -Message "Workspace '$($workspace.name)' - access denied" -Level 'WARN'
         }
         $workspaceCompleted = $true
     }
