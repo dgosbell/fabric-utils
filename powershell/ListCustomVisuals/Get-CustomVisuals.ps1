@@ -43,7 +43,8 @@
 
 .PARAMETER Resume
     Resume a previously interrupted scan. Loads progress from the state file and skips
-    already-processed workspaces. Requires a state file from a previous run.
+    already-processed workspaces. Workspaces that had errors or token issues in the
+    previous run are automatically retried with CSV cleanup.
 
 .PARAMETER StateFilePath
     Path to the JSON state file used for checkpoint/resume. Auto-generated alongside
@@ -302,6 +303,35 @@ function Test-TokenValidity {
     }
 }
 
+function Test-TokenExpiredError {
+    <#
+    .SYNOPSIS
+        Checks if an error is a TokenExpired error (HTTP 401 or Fabric errorCode "TokenExpired").
+    #>
+    param($ErrorRecord)
+
+    if (-not $ErrorRecord) { return $false }
+
+    # Check HTTP status code
+    $sc = $null
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            $sc = [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    } catch {}
+    if ($sc -eq 401) { return $true }
+
+    # Check error message/details for TokenExpired
+    $msg = "$($ErrorRecord.Exception.Message)"
+    if ($msg -match 'TokenExpired') { return $true }
+    try {
+        $details = $ErrorRecord.ErrorDetails.Message
+        if ($details -and $details -match 'TokenExpired') { return $true }
+    } catch {}
+
+    return $false
+}
+
 function Get-TokenExpiryMinutes {
     <#
     .SYNOPSIS
@@ -479,6 +509,9 @@ function Invoke-FabricApi {
             elseif ($statusCode -eq 403) {
                 throw $_
             }
+            elseif ($statusCode -eq 401 -or $fabricErrorCode -eq "TokenExpired") {
+                throw $_
+            }
             elseif ($isRetriable -and $attempt -lt $MaxRetries) {
                 $waitSec = [Math]::Pow(2, $attempt) * 5
                 Write-Warning "Retriable error '$fabricErrorCode' (attempt $attempt/$MaxRetries). Waiting $waitSec seconds..."
@@ -550,6 +583,9 @@ function Invoke-FabricApiRaw {
                 continue
             }
             elseif ($statusCode -eq 403) {
+                throw $_
+            }
+            elseif ($statusCode -eq 401) {
                 throw $_
             }
             elseif ($statusCode -eq 202) {
@@ -806,6 +842,7 @@ function Add-SelfToWorkspace {
         return $true
     }
     catch {
+        if (Test-TokenExpiredError -ErrorRecord $_) { throw }
         Write-ErrorLog "Failed to add self to workspace '$WorkspaceName' ($WorkspaceId): $_"
         return $false
     }
@@ -848,7 +885,7 @@ function Test-WorkspaceAccess {
         non-admin Get Group Users API (GET /groups/{id}/users) and finding the
         user's role. Returns the role name (Admin, Member, Contributor, Viewer)
         or $null if the user has no access.
-        Note: getDefinition requires at least Member access.
+        Note: A 401/403 from this non-admin endpoint means "no access", not "token expired".
     #>
     param(
         [string]$WorkspaceId,
@@ -870,6 +907,7 @@ function Test-WorkspaceAccess {
         return "Unknown"
     }
     catch {
+        # Don't rethrow — a 401/403 from this non-admin endpoint means "no access"
         return $null
     }
 }
@@ -878,6 +916,7 @@ function Restore-UserWorkspaceRole {
     <#
     .SYNOPSIS
         Restores a user's original workspace role, or removes them if they had no prior access.
+        Returns $true if the operation succeeded, $false if it failed (e.g., token expired).
     #>
     param(
         [string]$WorkspaceId,
@@ -888,7 +927,6 @@ function Restore-UserWorkspaceRole {
     )
 
     if ($OriginalRole) {
-        # User had an existing role — restore it via POST (updates the role)
         $uri = "$PowerBIApiBase/admin/groups/$WorkspaceId/users"
         $body = @{
             emailAddress         = $UserEmail
@@ -898,14 +936,21 @@ function Restore-UserWorkspaceRole {
         try {
             Invoke-FabricApi -Uri $uri -Method "POST" -Body $body -Headers $Headers
             Write-Log -Message "ACCESS RESTORED: Restored '$UserEmail' to '$OriginalRole' in workspace '$WorkspaceName' ($WorkspaceId)" -Level 'ACCESS'
+            return $true
         }
         catch {
             Write-ErrorLog "Failed to restore role '$OriginalRole' for '$UserEmail' in workspace '$WorkspaceName' ($WorkspaceId): $_"
+            return $false
         }
     }
     else {
-        # User had no prior access — remove them entirely
-        Remove-SelfFromWorkspace -WorkspaceId $WorkspaceId -WorkspaceName $WorkspaceName -UserEmail $UserEmail -Headers $Headers
+        try {
+            Remove-SelfFromWorkspace -WorkspaceId $WorkspaceId -WorkspaceName $WorkspaceName -UserEmail $UserEmail -Headers $Headers
+            return $true
+        }
+        catch {
+            return $false
+        }
     }
 }
 
@@ -1332,6 +1377,31 @@ elseif ($Resume) {
     $Resume = $false
 }
 
+# On resume, scan CSV for workspaces marked "Success" that have Error/AccessDenied rows
+if ($Resume -and (Test-Path $OutputPath)) {
+    $csvData = Import-Csv -Path $OutputPath
+    $failedStatuses = @("Error", "AccessDenied")
+    $workspacesWithErrors = $csvData |
+        Where-Object { $_.ScanStatus -in $failedStatuses } |
+        Select-Object -ExpandProperty WorkspaceId -Unique
+
+    $downgradeCount = 0
+    foreach ($wsId in $workspacesWithErrors) {
+        if ($scanState.processedWorkspaces.ContainsKey($wsId) -and $scanState.processedWorkspaces[$wsId] -eq "Success") {
+            $scanState.processedWorkspaces[$wsId] = "TokenError"
+            $downgradeCount++
+        }
+    }
+    if ($downgradeCount -gt 0) {
+        Write-Host "  $downgradeCount workspace(s) marked for re-scan (had Error/AccessDenied rows in CSV)" -ForegroundColor Yellow
+        Write-Log -Message "Downgraded $downgradeCount workspaces from Success to TokenError for re-scan" -Level 'INFO'
+        Save-ScanState -Path $StateFilePath -State $scanState
+    }
+    else {
+        Write-Host "  No workspaces with errors found in CSV" -ForegroundColor Green
+    }
+}
+
 # Remove existing output file so first Write-CsvRow creates it with headers (skip on resume)
 if (-not $Resume) {
     if (Test-Path $OutputPath) { Remove-Item $OutputPath -Force }
@@ -1577,6 +1647,7 @@ Write-Host ""
 $workspaceIndex = 0
 $workspacesAddedSelf = [System.Collections.Generic.List[string]]::new()
 $pimExpired = $false
+$consecutiveTokenErrors = 0
 
 try {
 foreach ($workspace in $workspacesToScan) {
@@ -1590,10 +1661,25 @@ foreach ($workspace in $workspacesToScan) {
         # Re-attempt AccessDenied workspaces if -AddSelfToWorkspaces is now enabled
         if ($previousStatus -eq "AccessDenied" -and $AddSelfToWorkspaces) {
             Write-Log -Message "Re-attempting workspace '$($workspace.name)' ($($workspace.id)) - was AccessDenied, now -AddSelfToWorkspaces is enabled" -Level 'INFO'
+            # Clean up any partial CSV rows from the previous attempt
+            if (Test-Path $OutputPath) {
+                $csvContent = Import-Csv -Path $OutputPath
+                $cleanedContent = $csvContent | Where-Object { $_.WorkspaceId -ne $workspace.id }
+                if ($cleanedContent) {
+                    $cleanedContent | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -Force
+                }
+                else {
+                    Remove-Item $OutputPath -Force
+                }
+                $removedCount = $csvContent.Count - @($cleanedContent).Count
+                if ($removedCount -gt 0) {
+                    Write-Log -Message "Removed $removedCount CSV rows for workspace '$($workspace.name)'" -Level 'INFO'
+                }
+            }
         }
-        elseif ($previousStatus -eq "InProgress") {
-            # Workspace was interrupted mid-scan — clean up partial CSV rows and re-scan
-            Write-Log -Message "Re-scanning workspace '$($workspace.name)' ($($workspace.id)) - was interrupted (InProgress)" -Level 'INFO'
+        elseif ($previousStatus -in @("InProgress", "TokenError")) {
+            # Workspace was interrupted or had token errors — clean up partial CSV rows and re-scan
+            Write-Log -Message "Re-scanning workspace '$($workspace.name)' ($($workspace.id)) - previous status: $previousStatus" -Level 'INFO'
             if (Test-Path $OutputPath) {
                 $csvContent = Import-Csv -Path $OutputPath
                 $cleanedContent = $csvContent | Where-Object { $_.WorkspaceId -ne $workspace.id }
@@ -2185,31 +2271,70 @@ foreach ($workspace in $workspacesToScan) {
             Write-Log -Message "Workspace '$($workspace.name)' - access denied" -Level 'WARN'
         }
         $workspaceCompleted = $true
+        $consecutiveTokenErrors = 0  # Reset on successful workspace completion
+    }
+    catch {
+        # Check if this is a token expiry error that wasn't caught by inner handlers
+        if (Test-TokenExpiredError -ErrorRecord $_) {
+            Write-Log -Message "Token expired during workspace '$($workspace.name)' processing. Attempting refresh..." -Level 'WARN'
+            $consecutiveTokenErrors++
+            try {
+                $fabricToken = Get-FabricToken
+                $pbiToken = Get-PowerBIToken
+                $fabricHeaders = Get-AuthHeaders -Token $fabricToken
+                $pbiHeaders = Get-AuthHeaders -Token $pbiToken
+                $tokenRefreshTime = Get-Date
+                if (-not (Test-TokenValidity -Headers $fabricHeaders)) {
+                    $pimExpired = $true
+                }
+            }
+            catch {
+                Write-ErrorLog "Token refresh failed after TokenExpired: $_"
+                $pimExpired = $true
+            }
+            if ($consecutiveTokenErrors -ge 3) {
+                Write-Log -Message "Multiple consecutive token errors ($consecutiveTokenErrors). Stopping scan." -Level 'ERROR'
+                $pimExpired = $true
+            }
+            # workspaceCompleted stays $false — will be marked TokenError
+        }
+        else {
+            Write-ErrorLog "Unexpected error processing workspace '$($workspace.name)': $_"
+            $workspaceCompleted = $true  # Non-token error — mark as completed with errors
+        }
     }
     finally {
-        # Determine workspace status for checkpoint — only finalize if processing completed
+        # Determine workspace status for checkpoint
         if ($workspaceCompleted) {
             $workspaceStatus = "Success"
             if ($accessDenied -or $wsAccessDenied) { $workspaceStatus = "AccessDenied" }
         }
+        elseif ($pimExpired) {
+            $workspaceStatus = "TokenError"
+        }
         else {
-            # Interrupted mid-scan — leave as InProgress for resume
             $workspaceStatus = "InProgress"
         }
 
         # Cleanup: restore original role or remove self from workspace
         if ($addedSelfThisWorkspace) {
             Write-Verbose "  Restoring access in workspace '$($workspace.name)'..."
-            Restore-UserWorkspaceRole -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -OriginalRole $originalWorkspaceRole -Headers $pbiHeaders
-            $scanState.selfAddedWorkspaces = [System.Collections.Generic.List[string]]@(
-                $scanState.selfAddedWorkspaces | Where-Object { $_ -ne $workspace.id }
-            )
+            $restored = Restore-UserWorkspaceRole -WorkspaceId $workspace.id -WorkspaceName $workspace.name -UserEmail $currentUserEmail -OriginalRole $originalWorkspaceRole -Headers $pbiHeaders
+            if ($restored) {
+                $scanState.selfAddedWorkspaces = [System.Collections.Generic.List[string]]@(
+                    $scanState.selfAddedWorkspaces | Where-Object { $_ -ne $workspace.id }
+                )
+            }
+            # If restore failed (e.g., token expired), workspace stays in selfAddedWorkspaces for cleanup on resume
         }
 
         # Checkpoint: save progress after each workspace
         $scanState.processedWorkspaces[$workspace.id] = $workspaceStatus
         Save-ScanState -Path $StateFilePath -State $scanState
     }
+
+    # Break out of workspace loop if PIM expired (set by catch block or token refresh)
+    if ($pimExpired) { break }
 }
 } # end try (outer workspace loop)
 finally {
