@@ -27,8 +27,12 @@ A PowerShell script that scans all Power BI reports across a Microsoft Fabric te
 4. **Tenant setting** — if using `-AddSelfToWorkspaces`, the tenant setting "Service admins can access workspaces" should be enabled
 
 ## Limitations
-* Cannot scan reports iņ other users "My Workspace" (personal workspaces)
-* Cannot scan the report instances in workspace Apps. It will scan the report in the source workspace, but if changes have not been published to the app there may be discrepencies.
+
+* **Requires Fabric Administrator role** — The executing identity must be a Power BI Service Administrator, Fabric Administrator, or Global Administrator. Without this role, the Admin APIs used to list workspaces and reports will return errors.
+* **Cannot scan personal workspaces** — Personal workspaces ("My Workspace") are discovered and listed in the CSV with `ScanStatus = "Skipped_PersonalWorkspace"`, but their report definitions cannot be accessed. Tenant admins cannot add themselves to other users' personal workspaces.
+* **Cannot scan app report instances** — The script scans reports in the source workspace, not the published copies inside workspace Apps. If changes have been made to a report but not yet published to the app, the scan reflects the source workspace version, which may differ from what app consumers see.
+* **Service-app managed reports cannot be exported** — Reports backed by service-app provisioned semantic models (e.g., Microsoft Project Web App, some Usage Metrics reports) explicitly deny definition export access. These are listed in the CSV with `ScanStatus = "Skipped_ServiceApp"` and are not retried on resume.
+* **PIM time-limited access** — If the administrator role is activated via Azure PIM (Privileged Identity Management), the scan may be interrupted when the PIM activation window expires. The script detects this and saves progress for resume, but large tenants may require multiple PIM activations to complete a full scan.
 
 ## Authentication
 
@@ -154,7 +158,7 @@ If you are a B2B guest admin scanning another organization's tenant, use `-Tenan
 | `ReportName` | Name of the Power BI report |
 | `ReportId` | GUID of the report |
 | `ReportUrl` | Direct URL to the report in the Fabric portal |
-| `ScanStatus` | `Success`, `Success_NoCustomVisuals`, `Skipped_PersonalWorkspace`, `AccessDenied`, `Error`, `NotInBulkExport` |
+| `ScanStatus` | `Success`, `Success_NoCustomVisuals`, `Skipped_PersonalWorkspace`, `Skipped_ServiceApp`, `AccessDenied`, `Error`, `NotInBulkExport` |
 | `CustomVisualId` | Internal identifier / GUID of the custom visual |
 | `CustomVisualDisplayName` | Human-readable display name (from AppSource catalog if available) |
 | `CustomVisualVersion` | Version string of the custom visual |

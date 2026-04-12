@@ -46,6 +46,11 @@
     already-processed workspaces. Workspaces that had errors or token issues in the
     previous run are automatically retried with CSV cleanup.
 
+.PARAMETER SkipRetryFailed
+    Used with -Resume. Skips the automatic re-scan of workspaces that had Error or
+    AccessDenied rows in the CSV. Useful when those errors are expected (e.g., service-app
+    reports) and you only want to process workspaces that weren't reached yet.
+
 .PARAMETER StateFilePath
     Path to the JSON state file used for checkpoint/resume. Auto-generated alongside
     the output CSV if not specified. When using -Resume, point this at the state file
@@ -69,6 +74,7 @@ param(
     [switch]$UseBulkExport,
     [int]$PermissionWaitSeconds = 300,
     [switch]$Resume,
+    [switch]$SkipRetryFailed,
     [string]$StateFilePath
 )
 
@@ -1378,7 +1384,7 @@ elseif ($Resume) {
 }
 
 # On resume, scan CSV for workspaces marked "Success" that have Error/AccessDenied rows
-if ($Resume -and (Test-Path $OutputPath)) {
+if ($Resume -and -not $SkipRetryFailed -and (Test-Path $OutputPath)) {
     $csvData = Import-Csv -Path $OutputPath
     $failedStatuses = @("Error", "AccessDenied")
     $workspacesWithErrors = $csvData |
@@ -1898,7 +1904,32 @@ foreach ($workspace in $workspacesToScan) {
                         $stats.ReportsSkipped++
                     }
                     catch {
-                        Write-ErrorLog "Error getting definition for report '$($report.name)' in '$($workspace.name)': $_"
+                        # Check if this is a non-retriable service-app or model-access error
+                        $errMsg = "$($_.Exception.Message)"
+                        if ($errMsg -match 'denied access to read the model' -or $errMsg -match 'configured by service apps' -or $errMsg -match 'Cannot export artifact') {
+                            Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped (service-app managed model)" -Level 'WARN'
+                            Write-CsvRow ([PSCustomObject]@{
+                                WorkspaceName           = $workspace.name
+                                WorkspaceId             = $workspace.id
+                                WorkspaceType           = "Workspace"
+                                ReportName              = $report.name
+                                ReportId                = $report.id
+                                ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
+                                ScanStatus              = "Skipped_ServiceApp"
+                                CustomVisualId          = ""
+                                CustomVisualDisplayName = ""
+                                CustomVisualVersion     = ""
+                                CustomVisualPublisher   = ""
+                                CustomVisualSource      = ""
+                                AppSourceLink           = ""
+                                PageName                = ""
+                                IsCertified             = ""
+                                DefinitionFormat        = ""
+                            })
+                            $stats.ReportsSkipped++
+                        }
+                        else {
+                            Write-ErrorLog "Error getting definition for report '$($report.name)' in '$($workspace.name)': $_"
                         Write-CsvRow ([PSCustomObject]@{
                             WorkspaceName           = $workspace.name
                             WorkspaceId             = $workspace.id
@@ -1919,6 +1950,7 @@ foreach ($workspace in $workspacesToScan) {
                         })
                         $stats.ReportsErrored++
                         Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Error during processing" -Level 'ERROR'
+                        }
                     }
                 }
                 Write-Progress -Id 1 -Activity "Fallback" -Completed
@@ -2206,6 +2238,31 @@ foreach ($workspace in $workspacesToScan) {
                         Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Access denied" -Level 'WARN'
                     }
                     else {
+                        # Check if this is a non-retriable service-app or model-access error
+                        $errMsg = "$($_.Exception.Message)"
+                        if ($errMsg -match 'denied access to read the model' -or $errMsg -match 'configured by service apps' -or $errMsg -match 'Cannot export artifact') {
+                            Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Skipped (service-app managed model)" -Level 'WARN'
+                            Write-CsvRow ([PSCustomObject]@{
+                                WorkspaceName           = $workspace.name
+                                WorkspaceId             = $workspace.id
+                                WorkspaceType           = "Workspace"
+                                ReportName              = $report.name
+                                ReportId                = $report.id
+                                ReportUrl               = "https://app.fabric.microsoft.com/groups/$($workspace.id)/reports/$($report.id)"
+                                ScanStatus              = "Skipped_ServiceApp"
+                                CustomVisualId          = ""
+                                CustomVisualDisplayName = ""
+                                CustomVisualVersion     = ""
+                                CustomVisualPublisher   = ""
+                                CustomVisualSource      = ""
+                                AppSourceLink           = ""
+                                PageName                = ""
+                                IsCertified             = ""
+                                DefinitionFormat        = ""
+                            })
+                            $stats.ReportsSkipped++
+                        }
+                        else {
                         Write-ErrorLog "Error getting definition for report '$($report.name)' in '$($workspace.name)': $_"
                         Write-CsvRow ([PSCustomObject]@{
                             WorkspaceName           = $workspace.name
@@ -2227,6 +2284,7 @@ foreach ($workspace in $workspacesToScan) {
                         })
                         $stats.ReportsErrored++
                         Write-Log -Message "  Report: '$($report.name)' ($($report.id)) - Error during processing" -Level 'ERROR'
+                        }
                     }
                 }
             }
