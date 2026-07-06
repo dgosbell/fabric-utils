@@ -7,8 +7,8 @@
 
 .DESCRIPTION
     Pulls the workspace list from the newer Fabric Admin REST API (v1/admin/workspaces) and
-    resolves each workspace's capacity name + SKU tier from the Power BI admin capacities API
-    (the tenant-wide capacity list, joined on capacityId).
+    resolves each workspace's capacity name + raw SKU (e.g. F64, P1) from the Power BI admin
+    capacities API (the tenant-wide capacity list, joined on capacityId).
 
     Note: the Fabric admin workspaces API does not expose workspace Description (neither the
     list nor the per-workspace Get), so the Description column is written but left blank. The
@@ -26,9 +26,11 @@
 
 .PREREQUISITES
     * Fabric / Power BI tenant admin rights (Tenant.Read.All).
-    * The script installs the MicrosoftPowerBIMgmt module and signs you in automatically.
-      To skip that (e.g. in automation) supply your own bearer token via -AccessToken, or
-      pass a service principal via -TenantId / -ServicePrincipalId / -ServicePrincipalSecret.
+    * The script installs the MicrosoftPowerBIMgmt module if needed, then prompts you to
+      choose an identity - interactive user sign-in (browser account picker) or a service
+      principal. If you're already signed in, it asks whether to reuse that account or switch.
+      For unattended runs, bypass the prompt by passing -AccessToken, or all three of
+      -TenantId / -ServicePrincipalId / -ServicePrincipalSecret.
 
 .PARAMETER OutputPath
     Path to the CSV file to write. Defaults to .\FabricWorkspaces_<timestamp>.csv
@@ -45,10 +47,6 @@
 .PARAMETER MaxRetries
     Max retry attempts per request before giving up. Default 6.
 
-.PARAMETER UseRawSku
-    If set, the "Capacity SKU Tier" column contains the raw SKU (e.g. F64, P1) instead of
-    the derived tier label (Fabric / Premium / Embedded / Trial).
-
 .PARAMETER TenantId
 .PARAMETER ServicePrincipalId
 .PARAMETER ServicePrincipalSecret
@@ -63,7 +61,8 @@
     you have already connected in the current session).
 
 .EXAMPLE
-    # Fully self-contained: installs the module (if needed), signs you in, then exports.
+    # Self-contained: installs the module if needed, prompts you to pick the sign-in
+    # identity, then exports.
     .\Export-FabricWorkspaces.ps1 -OutputPath .\workspaces.csv
 
 .EXAMPLE
@@ -71,7 +70,7 @@
     .\Export-FabricWorkspaces.ps1 -TenantId $tid -ServicePrincipalId $appId -ServicePrincipalSecret $secret
 
 .EXAMPLE
-    .\Export-FabricWorkspaces.ps1 -AccessToken $myToken -BatchSize 1000 -UseRawSku
+    .\Export-FabricWorkspaces.ps1 -AccessToken $myToken -BatchSize 1000
 #>
 
 [CmdletBinding()]
@@ -82,7 +81,6 @@ param(
     [string] $AccessToken,
     [ValidateRange(0, 20)]
     [int]    $MaxRetries  = 6,
-    [switch] $UseRawSku,
 
     # --- Auth / bootstrap ---
     [string] $TenantId,
@@ -102,8 +100,42 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# Ensure the MicrosoftPowerBIMgmt module is installed + imported, then make
-# sure we are signed in. Skipped when a raw -AccessToken is supplied.
+# Best-effort decode of the signed-in identity (UPN / app id) from a bearer
+# token, so we can show the user which account they are connected as.
+# ---------------------------------------------------------------------------
+function Get-TokenIdentity {
+    param([string]$Bearer)
+    try {
+        $jwt   = ($Bearer -replace '^(?i)bearer\s+', '')
+        $parts = $jwt.Split('.')
+        if ($parts.Count -lt 2) { return $null }
+        $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+        switch ($payload.Length % 4) { 2 { $payload += '==' } 3 { $payload += '=' } }
+        $claims = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+        foreach ($c in @('upn', 'preferred_username', 'unique_name', 'email', 'appid')) {
+            if ($claims.$c) { return [string]$claims.$c }
+        }
+    } catch { }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# Sign in with a service principal (app registration).
+# ---------------------------------------------------------------------------
+function Connect-ServicePrincipalIdentity {
+    param(
+        [Parameter(Mandatory)] [string] $TenantId,
+        [Parameter(Mandatory)] [string] $AppId,
+        [Parameter(Mandatory)] [System.Security.SecureString] $Secret
+    )
+    $cred = New-Object System.Management.Automation.PSCredential($AppId, $Secret)
+    Connect-PowerBIServiceAccount -ServicePrincipal -Credential $cred -Tenant $TenantId | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# Ensure the MicrosoftPowerBIMgmt module is installed, then sign in - prompting
+# interactively for which identity to use unless a service principal (or a raw
+# -AccessToken) was supplied on the command line.
 # ---------------------------------------------------------------------------
 function Initialize-PowerBIConnection {
     param(
@@ -116,7 +148,7 @@ function Initialize-PowerBIConnection {
     # PowerShell Gallery needs TLS 1.2 (matters on Windows PowerShell 5.1).
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
-    # 1. Install the module if it isn't already available.
+    # Install the module if it isn't already available.
     if (-not (Get-Module -ListAvailable -Name MicrosoftPowerBIMgmt)) {
         Write-Host "Installing MicrosoftPowerBIMgmt module (scope $Scope)..." -ForegroundColor Cyan
         if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
@@ -129,22 +161,46 @@ function Initialize-PowerBIConnection {
     }
     Import-Module MicrosoftPowerBIMgmt -ErrorAction Stop
 
-    # 2. Connect if we don't already have a valid session.
-    $connected = $false
-    try { $null = Get-PowerBIAccessToken -ErrorAction Stop; $connected = $true } catch { }
-
-    if (-not $connected) {
-        if ($ServicePrincipalId -and $ServicePrincipalSecret -and $TenantId) {
-            Write-Host "Signing in with service principal..." -ForegroundColor Cyan
-            $secure = ConvertTo-SecureString $ServicePrincipalSecret -AsPlainText -Force
-            $cred   = New-Object System.Management.Automation.PSCredential($ServicePrincipalId, $secure)
-            Connect-PowerBIServiceAccount -ServicePrincipal -Credential $cred -Tenant $TenantId | Out-Null
-        }
-        else {
-            Write-Host "Signing in to Power BI / Fabric (a browser prompt may appear)..." -ForegroundColor Cyan
-            Connect-PowerBIServiceAccount | Out-Null
-        }
+    # A full service principal supplied on the command line signs in with no prompt.
+    if ($ServicePrincipalId -and $ServicePrincipalSecret -and $TenantId) {
+        Write-Host "Signing in with the supplied service principal..." -ForegroundColor Cyan
+        $sec = ConvertTo-SecureString $ServicePrincipalSecret -AsPlainText -Force
+        Connect-ServicePrincipalIdentity -TenantId $TenantId -AppId $ServicePrincipalId -Secret $sec
+        return
     }
+
+    # If there's already a cached session, offer to reuse it or switch identity.
+    $current = $null
+    try { $current = Get-TokenIdentity (Get-PowerBIAccessToken -AsString -ErrorAction Stop) } catch { }
+    if ($current) {
+        $ans = Read-Host "Already signed in as '$current'. Press Enter to use this account, or type 's' to sign in as someone else"
+        if ($ans -notmatch '^(?i)s') { return }
+        try { Disconnect-PowerBIServiceAccount -ErrorAction SilentlyContinue | Out-Null } catch { }
+    }
+
+    # Prompt for which identity / sign-in method to use.
+    Write-Host ""
+    Write-Host "How would you like to sign in?" -ForegroundColor Cyan
+    Write-Host "  [1] Interactive user sign-in (browser account picker)   [default]"
+    Write-Host "  [2] Service principal (app registration)"
+    $choice = Read-Host "Selection"
+
+    if ($choice -eq '2') {
+        $tid = Read-Host "  Tenant ID (GUID)"
+        $app = Read-Host "  Application (client) ID (GUID)"
+        $sec = Read-Host "  Client secret" -AsSecureString
+        Connect-ServicePrincipalIdentity -TenantId $tid -AppId $app -Secret $sec
+    }
+    else {
+        Write-Host "Opening interactive sign-in - pick the account to use in the browser window..." -ForegroundColor Cyan
+        Connect-PowerBIServiceAccount | Out-Null
+    }
+
+    # Confirm the resulting identity.
+    try {
+        $who = Get-TokenIdentity (Get-PowerBIAccessToken -AsString -ErrorAction Stop)
+        if ($who) { Write-Host ("Signed in as: {0}" -f $who) -ForegroundColor Green }
+    } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -259,23 +315,6 @@ function Invoke-AdminApi {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Map a capacity SKU to a tier label (matches the Admin Portal export intent).
-# Easily editable if your tenant expects different labels.
-# ---------------------------------------------------------------------------
-function ConvertTo-SkuTier {
-    param([string]$Sku)
-    if ([string]::IsNullOrWhiteSpace($Sku)) { return '' }
-    switch -Regex ($Sku.Trim().ToUpperInvariant()) {
-        '^FT'   { return 'Trial' }      # FT1  -> Fabric trial
-        '^F\d'  { return 'Fabric' }     # F2..F2048
-        '^P\d'  { return 'Premium' }    # P1..P5  Power BI Premium
-        '^EM\d' { return 'Embedded' }   # EM1..EM3
-        '^A\d'  { return 'Embedded' }   # A1..A6  (Power BI Embedded / Azure)
-        default { return $Sku }         # unknown -> surface raw SKU
-    }
-}
-
 # ===========================================================================
 # MAIN
 # ===========================================================================
@@ -367,13 +406,13 @@ do {
 
     foreach ($w in $items) {
         $capName = ''
-        $capTier = ''
+        $capSku  = ''
         if ($w.capacityId) {
             $key = [string]$w.capacityId.ToString().ToLowerInvariant()
             if ($capMap.ContainsKey($key)) {
                 $cap     = $capMap[$key]
                 $capName = $cap.Name
-                $capTier = if ($UseRawSku) { $cap.Sku } else { ConvertTo-SkuTier -Sku $cap.Sku }
+                $capSku  = $cap.Sku
             }
             else {
                 # capacityId present but not in the capacity list - track for a summary.
@@ -392,7 +431,7 @@ do {
             'Type'              = $w.type
             'State'             = $w.state
             'Capacity name'     = $capName
-            'Capacity SKU Tier' = $capTier
+            'Capacity SKU Tier' = $capSku
         })
 
         if ($script:buffer.Count -ge $BatchSize) { Write-Batch }
